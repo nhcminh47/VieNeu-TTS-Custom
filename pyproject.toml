@@ -64,11 +64,14 @@ requires-python = ">=3.10"
 dependencies = [
     "sea-g2p>=0.7.5",
     "onnxruntime>=1.20.0",
-    "llama-cpp-python==0.3.16",
     "requests",
     "numpy",
     "soundfile",
     "PyYAML",
+    "fastapi",
+    "uvicorn",
+    "huggingface-hub",
+    "transformers",
     "gradio>=5.49.1",
     "perth>=0.2.0",
     "librosa>=0.11.0",
@@ -84,6 +87,9 @@ dependencies = [
 "Changelog" = "https://github.com/pnnbao97/VieNeu-TTS/releases"
 
 [project.optional-dependencies]
+gguf = [
+    "llama-cpp-python==0.3.16",
+]
 gpu = [
     "torch",
     "torchaudio",
@@ -120,6 +126,7 @@ pythonpath = ["src"]
 [project.scripts]
 vieneu-web = "apps.gradio_main:main"
 vieneu-stream = "apps.web_stream:main"
+vieneu-server = "vieneu_server.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src", "apps" = "apps", "examples" = "examples"}

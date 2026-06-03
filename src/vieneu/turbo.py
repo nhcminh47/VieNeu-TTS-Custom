@@ -24,6 +24,14 @@ class BaseTurboVieNeuTTS(BaseVieneuTTS):
 
     def _get_onnx_providers(self, device: str) -> list:
         if device == "cuda":
+            import onnxruntime as ort
+            available = set(ort.get_available_providers())
+            if "CUDAExecutionProvider" not in available:
+                logger.info(
+                    "ONNX Runtime CUDAExecutionProvider is not available; "
+                    "using CPUExecutionProvider for VieNeu codec."
+                )
+                return ["CPUExecutionProvider"]
             return ["CUDAExecutionProvider", "CPUExecutionProvider"]
         return ["CPUExecutionProvider"]
 
@@ -170,8 +178,8 @@ class TurboGPUVieNeuTTS(BaseTurboVieNeuTTS):
             from transformers import AutoTokenizer, AutoModelForCausalLM
             logger.info(f"⏳ Loading Turbo GPU (Standard) from: {repo} on {self.device}...")
             self.tokenizer = AutoTokenizer.from_pretrained(repo, token=hf_token)
-            dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
-            self.backbone = AutoModelForCausalLM.from_pretrained(repo, torch_dtype=dtype, token=hf_token).to(torch.device(self.device))
+            dtype = torch.float16 if self.device == "cuda" else torch.float32
+            self.backbone = AutoModelForCausalLM.from_pretrained(repo, dtype=dtype, token=hf_token).to(torch.device(self.device))
             self.backbone.eval()
             logger.info(f"✅ Turbo GPU (Standard) ready")
 
@@ -190,6 +198,9 @@ class TurboGPUVieNeuTTS(BaseTurboVieNeuTTS):
     def infer(self, text: str, voice: Optional[Any] = None, ref_codes: Optional[Any] = None, temperature: float = 0.4, top_k: int = 50, max_chars: int = 256, skip_normalize: bool = False, skip_phonemize: bool = False, show_progress: bool = True, apply_watermark: bool = True, **kwargs) -> np.ndarray:
         phonemes = phonemize_text(text) if not skip_phonemize else text
         chunks = split_into_chunks_v2(phonemes, max_chunk_size=max_chars)
+        progress_callback = kwargs.get("progress_callback")
+        total_chunks = len(chunks)
+        logger.info("Turbo GPU synthesis split text into %d chunk(s)", total_chunks)
 
         if voice is None:
             voice = ref_codes if ref_codes is not None else self.get_preset_voice()
@@ -199,6 +210,8 @@ class TurboGPUVieNeuTTS(BaseTurboVieNeuTTS):
         pbar = tqdm(chunks, desc="🚀 Synthesizing", disable=not (show_progress and len(chunks) > 1), leave=False)
         for i, chunk in enumerate(pbar):
             pbar.set_description(f"  🔊 Chunk {i+1}/{len(chunks)}")
+            if progress_callback:
+                progress_callback(i, total_chunks, f"Processing chunk {i + 1}/{total_chunks}")
             prompt = self._format_turbo_prompt(chunk.text)
             if self.backend == "lmdeploy":
                 self.gen_config.temperature, self.gen_config.top_k = temperature, top_k
@@ -209,6 +222,9 @@ class TurboGPUVieNeuTTS(BaseTurboVieNeuTTS):
             
             wav = self._decode(generated_text, voice_embedding)
             all_wavs.append(wav)
+            logger.info("Turbo GPU completed chunk %d/%d", i + 1, total_chunks)
+            if progress_callback:
+                progress_callback(i + 1, total_chunks, f"Completed chunk {i + 1}/{total_chunks}")
             if i < len(chunks) - 1:
                 silence_dur = get_silence_duration_v2(chunk)
                 if silence_dur > 0:
@@ -329,6 +345,9 @@ class TurboVieNeuTTS(BaseTurboVieNeuTTS):
             chunks = phonemize_to_chunks(
                 text, max_chars=max_chars, skip_normalize=skip_normalize
             )
+        progress_callback = kwargs.get("progress_callback")
+        total_chunks = len(chunks)
+        logger.info("Turbo GGUF synthesis split text into %d chunk(s)", total_chunks)
 
         if voice is None:
             voice = ref_codes if ref_codes is not None else self.get_preset_voice()
@@ -339,12 +358,17 @@ class TurboVieNeuTTS(BaseTurboVieNeuTTS):
         for i, chunk in enumerate(pbar):
             pbar.set_description(f"  🔊 Chunk {i+1}/{len(chunks)}")
             self.backbone.reset()
+            if progress_callback:
+                progress_callback(i, total_chunks, f"Processing chunk {i + 1}/{total_chunks}")
             result = self.backbone(
                 self._format_turbo_prompt(chunk.text), max_tokens=kwargs.get("max_tokens", 2048),
                 temperature=temperature, top_k=top_k, top_p=0.95, min_p=0.05,
                 stop=["<|SPEECH_GENERATION_END|>"], repeat_penalty=1.15, echo=False,
             )
             all_wavs.append(self._decode(result["choices"][0]["text"], voice_embedding))
+            logger.info("Turbo GGUF completed chunk %d/%d", i + 1, total_chunks)
+            if progress_callback:
+                progress_callback(i + 1, total_chunks, f"Completed chunk {i + 1}/{total_chunks}")
             if i < len(chunks) - 1:
                 silence_dur = get_silence_duration_v2(chunk)
                 if silence_dur > 0:

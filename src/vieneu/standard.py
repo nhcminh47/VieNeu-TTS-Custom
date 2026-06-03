@@ -1,7 +1,7 @@
 import os
 import platform
 from pathlib import Path
-from typing import Optional, Union, List, Generator, Any, Dict
+from typing import Optional, Union, List, Generator, Any, Dict, Callable
 import numpy as np
 import gc
 import logging
@@ -11,6 +11,7 @@ from vieneu_utils.phonemize_text import phonemize_with_dict, phonemize_batch
 from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks
 
 logger = logging.getLogger("Vieneu.Standard")
+ProgressCallback = Callable[[int, int, str], None]
 
 class VieNeuTTS(BaseVieneuTTS):
     """
@@ -203,8 +204,12 @@ class VieNeuTTS(BaseVieneuTTS):
         chunks = split_text_into_chunks(text, max_chars=max_chars)
         if not chunks:
             return np.array([], dtype=np.float32)
+        progress_callback: Optional[ProgressCallback] = kwargs.get("progress_callback")
+        logger.info("Standard synthesis split text into %d chunk(s)", len(chunks))
 
         if len(chunks) == 1:
+            if progress_callback:
+                progress_callback(0, 1, "Processing chunk 1/1")
             ref_phonemes = self.get_ref_phonemes(ref_text)
             phonemes = phonemize_with_dict(chunks[0], skip_normalize=True)
             if self._is_quantized_model:
@@ -215,6 +220,8 @@ class VieNeuTTS(BaseVieneuTTS):
             wav = self._decode(output_str)
             if apply_watermark:
                 wav = self._apply_watermark(wav)
+            if progress_callback:
+                progress_callback(1, 1, "Completed chunk 1/1")
             return wav
 
         all_wavs = self.infer_batch(
@@ -240,28 +247,41 @@ class VieNeuTTS(BaseVieneuTTS):
 
         ref_phonemes = self.get_ref_phonemes(ref_text)
         chunk_phonemes = phonemize_batch(texts, skip_normalize=True)
+        progress_callback: Optional[ProgressCallback] = kwargs.get("progress_callback")
+        total_chunks = len(chunk_phonemes)
+        logger.info("Standard batch synthesis processing %d chunk(s)", total_chunks)
 
         all_wavs = []
         # If model is GGUF, we still process sequentially for now as llama-cpp-python batching for TTS is complex
         if self._is_quantized_model:
-            for phonemes in chunk_phonemes:
+            for index, phonemes in enumerate(chunk_phonemes, start=1):
+                if progress_callback:
+                    progress_callback(index - 1, total_chunks, f"Processing chunk {index}/{total_chunks}")
                 output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
                 wav = self._decode(output_str)
                 if apply_watermark:
                     wav = self._apply_watermark(wav)
                 all_wavs.append(wav)
+                logger.info("Standard batch completed chunk %d/%d", index, total_chunks)
+                if progress_callback:
+                    progress_callback(index, total_chunks, f"Completed chunk {index}/{total_chunks}")
         # If model is Torch, we can leverage true batch generation
         else:
             import torch
-            batch_prompt_ids = []
-            for phonemes in chunk_phonemes:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
-                batch_prompt_ids.append(torch.tensor(prompt_ids))
-
-            inputs = self.tokenizer.pad(
-                {"input_ids": batch_prompt_ids},
+            prompt_texts = [
+                self._format_chat_prompt_text(
+                    ref_codes,
+                    ref_phonemes,
+                    phonemes,
+                    emotion_tag=kwargs.get('emotion_tag', self.default_emotion),
+                )
+                for phonemes in chunk_phonemes
+            ]
+            inputs = self.tokenizer(
+                prompt_texts,
+                add_special_tokens=False,
                 padding=True,
-                return_tensors="pt"
+                return_tensors="pt",
             )
             # Move all tensors to device
             inputs = {k: v.to(self.backbone.device) for k, v in inputs.items()}
@@ -281,12 +301,17 @@ class VieNeuTTS(BaseVieneuTTS):
 
             input_length = inputs["input_ids"].shape[-1]
             for i in range(len(texts)):
+                if progress_callback:
+                    progress_callback(i, total_chunks, f"Decoding chunk {i + 1}/{total_chunks}")
                 generated_ids = output_tokens[i, input_length:]
                 output_str = self.tokenizer.decode(generated_ids, add_special_tokens=False)
                 wav = self._decode(output_str)
                 if apply_watermark:
                     wav = self._apply_watermark(wav)
                 all_wavs.append(wav)
+                logger.info("Standard batch completed chunk %d/%d", i + 1, total_chunks)
+                if progress_callback:
+                    progress_callback(i + 1, total_chunks, f"Completed chunk {i + 1}/{total_chunks}")
 
         return all_wavs
 
@@ -343,6 +368,24 @@ class VieNeuTTS(BaseVieneuTTS):
             ids = [text_prompt_start] + emotion_prefix_ids + input_ids + [text_prompt_end, speech_gen_start] + list(codes)
 
         return ids
+
+    def _format_chat_prompt_text(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, emotion_tag: Optional[str] = None) -> str:
+        ref_codes_list = self.to_list(ref_codes)
+        full_phonemes = f"{ref_phonemes} {chunk_phonemes}"
+        codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
+
+        if self.use_chat_format:
+            return (
+                "user: Convert the text to speech:"
+                f"<|TEXT_PROMPT_START|>{full_phonemes}<|TEXT_PROMPT_END|>\n"
+                f"assistant:<|SPEECH_GENERATION_START|>{codes_str}"
+            )
+
+        emotion_prefix = emotion_tag if emotion_tag else ""
+        return (
+            f"<|TEXT_PROMPT_START|>{emotion_prefix}{full_phonemes}<|TEXT_PROMPT_END|>"
+            f"<|SPEECH_GENERATION_START|>{codes_str}"
+        )
 
     def _infer_torch(self, prompt_ids: List[int], temperature: float = 1.0, top_k: int = 50) -> str:
         import torch

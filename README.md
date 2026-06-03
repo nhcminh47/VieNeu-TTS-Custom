@@ -1,5 +1,168 @@
 # 🦜 VieNeu-TTS
 
+## VieNeu SM61 Backend Fork
+
+This fork adds a backend-only FastAPI server for local VieNeu TTS inference on older NVIDIA GPUs starting at compute capability `sm_61`, including GTX 1070 Ti 8GB.
+
+Key backend defaults:
+
+- PyTorch/local inference is the default backend.
+- LMDeploy is optional and is not required for `vieneu-server`.
+- FlashAttention, Triton, XFormers, BF16, and `torch.compile` are not required for the server path.
+- CUDA is selected only when the GPU is `sm_61` or newer; otherwise the server falls back to CPU.
+- User-selectable TTS model IDs are restricted to VieNeu Hugging Face repositories.
+- The frontend UI is out of scope for this backend server; a separate Next.js PWA can consume the HTTP and WebSocket APIs.
+- Generated audio is saved as one WAV per job and pruned by storage retention defaults: 100 files or 2 GiB.
+- Long-form synthesis defaults to smaller 180-character chunks with conservative sampling to reduce drift.
+
+Long-form quality knobs:
+
+```powershell
+$env:VIENEU_TTS_MAX_CHARS = "160"
+$env:VIENEU_TTS_TEMPERATURE = "0.35"
+$env:VIENEU_TTS_TOP_K = "40"
+$env:VIENEU_TTS_SILENCE_SECONDS = "0.20"
+$env:VIENEU_TTS_CROSSFADE_SECONDS = "0.015"
+```
+
+For the best long-script quality, prefer `pnnbao-ump/VieNeu-TTS-v2` over the Turbo model when your GPU/memory can handle it. Turbo is faster, but long-form prosody is usually more stable on the full model.
+
+Novel mode uses dedicated chapter jobs:
+
+- `POST /tts/chapter-jobs`
+- `GET /tts/chapter-jobs/{job_id}`
+- `GET /tts/chapter-jobs/{job_id}/audio`
+- `GET /tts/chapter-jobs/{job_id}/manifest`
+- `WS /ws/chapter-jobs/{job_id}`
+
+Set `VIENEU_MAX_CHAPTER_TEXT_LENGTH` to raise or lower the maximum chapter size.
+
+Start the backend server:
+
+```bash
+vieneu-server
+```
+
+Run the Next.js PWA frontend:
+
+```bash
+cd frontend
+corepack enable
+pnpm install
+pnpm dev
+```
+
+The backend remains API-only, so `http://127.0.0.1:8000/` may return 404. Open the PWA at `http://127.0.0.1:3000/`; it calls backend HTTP/audio APIs through the Next.js proxy at `/api/vieneu` by default.
+
+Run both backend and PWA with Docker Compose:
+
+```bash
+docker compose -f docker/docker-compose.pwa.yml up --build
+```
+
+For an NVIDIA Docker runtime with CUDA 11.8 PyTorch wheels:
+
+```bash
+TORCH_INSTALL=cu118 docker compose -f docker/docker-compose.pwa.yml up --build
+```
+
+On PowerShell:
+
+```powershell
+$env:TORCH_INSTALL = "cu118"
+$env:VIENEU_GPUS = "all"
+docker compose -f docker/docker-compose.pwa.yml up --build
+```
+
+Verify Docker can see the GPU before starting VieNeu:
+
+```powershell
+docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+```
+
+Expose the custom FastAPI backend through a public bore tunnel:
+
+```bash
+TORCH_INSTALL=cu118 docker compose -f docker/docker-compose.pwa.yml --profile tunnel up --build
+```
+
+Watch the `vieneu-server-tunnel` logs for the public address, for example `http://bore.pub:31631`. Paste that URL into the VieNeu Studio server field if the PWA is running in another browser or machine. This tunnel points to the custom backend on port `8000`; the upstream VieNeu Docker image uses a different LMDeploy server on port `23333`.
+
+On PowerShell, set `TORCH_INSTALL` before the Docker command:
+
+```powershell
+$env:TORCH_INSTALL = "cu118"
+$env:VIENEU_GPUS = "all"
+docker compose -f docker/docker-compose.pwa.yml --profile tunnel up --build
+```
+
+Expose the VieNeu Studio frontend through Cloudflare Tunnel:
+
+Run these commands from the repository root, for example `D:\Repo\VieNeu-TTS-Custom` on Windows. The compose file uses variables from the root `.env`, so include `--env-file .env` in the Docker Compose command.
+
+1. Add the token and public settings to `.env` at the repo root:
+
+```dotenv
+TUNNEL_TOKEN=your-token-here
+NEXT_PUBLIC_VIENEU_API_BASE=/api/vieneu
+VIENEU_INTERNAL_API_BASE=http://server:8000
+VIENEU_PUBLIC_FRONTEND_ORIGIN=https://tts.example.vn
+```
+
+2. Start backend, frontend, and the Cloudflare tunnel:
+
+```powershell
+$env:TORCH_INSTALL = "cu118"
+$env:VIENEU_GPUS = "all"
+docker compose --env-file .env -f docker/docker-compose.pwa.yml --profile frontend-tunnel up --build
+```
+
+3. In Cloudflare Zero Trust, set the frontend public hostname service to the Docker service URL:
+
+```text
+tts.example.vn -> http://frontend:3000
+```
+
+Do not use `http://localhost:3000` there. Inside the `cloudflared` container, `localhost` is the tunnel container itself, not another Compose service. Use Docker service names such as `frontend:3000`.
+
+4. Keep the browser on the same-origin Next.js proxy and let the frontend container call the backend privately. These values belong in the root `.env` used by `--env-file .env`:
+
+```dotenv
+NEXT_PUBLIC_VIENEU_API_BASE=/api/vieneu
+VIENEU_INTERNAL_API_BASE=http://server:8000
+VIENEU_PUBLIC_FRONTEND_ORIGIN=https://tts.example.vn
+```
+
+The proxy avoids CORS for browser HTTP and audio requests. It does not provide authentication by itself; keep the backend hostname private unless you intentionally want a public API.
+
+5. For realtime WebSocket events online, add a Cloudflare path rule for the same public hostname:
+
+```text
+tts.example.vn/ws/* -> http://server:8000
+```
+
+Then set:
+
+```dotenv
+NEXT_PUBLIC_VIENEU_WS_BASE=https://tts.example.vn
+```
+
+If WebSocket routing is not configured, the PWA still polls job status.
+
+`NEXT_PUBLIC_*` values are compiled into the Next.js browser bundle. Rebuild the frontend image after changing them:
+
+```powershell
+docker compose --env-file .env -f docker/docker-compose.pwa.yml --profile frontend-tunnel build --no-cache frontend
+docker compose --env-file .env -f docker/docker-compose.pwa.yml --profile frontend-tunnel up
+```
+
+Useful docs:
+
+- `docs/setup-sm61.md`
+- `docs/api.md`
+- `docs/troubleshooting.md`
+- `docs/specs/`
+
 [![Awesome](https://img.shields.io/badge/Awesome-NLP-green?logo=github)](https://github.com/keon/awesome-nlp)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Us-5865F2?logo=discord&logoColor=white)](https://discord.gg/yJt8kzjzWZ)
 

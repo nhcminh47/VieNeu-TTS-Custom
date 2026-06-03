@@ -39,6 +39,13 @@ def test_turbo_gguf_init(mock_hf, mock_llama, mock_ort):
     assert tts.decoder_sess is not None
     mock_llama.assert_called_once()
 
+
+@patch("onnxruntime.get_available_providers", return_value=["CPUExecutionProvider"])
+def test_turbo_onnx_cuda_provider_falls_back_to_cpu(mock_providers):
+    tts = TurboVieNeuTTS.__new__(TurboVieNeuTTS)
+    providers = tts._get_onnx_providers("cuda")
+    assert providers == ["CPUExecutionProvider"]
+
 @patch("onnxruntime.InferenceSession")
 @patch("llama_cpp.Llama")
 @patch("huggingface_hub.hf_hub_download", return_value="dummy_path")

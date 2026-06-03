@@ -10,6 +10,7 @@ from pathlib import Path
 def mock_torch_components():
     tokenizer = MagicMock()
     tokenizer.pad.return_value = {"input_ids": torch.zeros((2, 10), dtype=torch.long)}
+    tokenizer.return_value = {"input_ids": torch.zeros((2, 10), dtype=torch.long)}
     tokenizer.convert_tokens_to_ids.side_effect = lambda x: 1001 if x.startswith("<|") else 999
     tokenizer.decode.return_value = "<|speech_1|><|speech_2|>"
     
@@ -77,10 +78,19 @@ def test_vieneu_tts_infer_with_voice_preset(mock_tts_instance):
 def test_vieneu_tts_infer_batch(mock_tts_instance):
     mock_tts_instance._is_quantized_model = False # Force torch path
     texts = ["Text 1", "Text 2"]
+    progress_events = []
     with patch("vieneu.standard.phonemize_batch", return_value=["p1", "p2"]), \
          patch.object(mock_tts_instance, '_decode', return_value=np.zeros(1000)):
-        results = mock_tts_instance.infer_batch(texts, ref_codes=[1], ref_text="ref")
+        results = mock_tts_instance.infer_batch(
+            texts,
+            ref_codes=[1],
+            ref_text="ref",
+            progress_callback=lambda done, total, message: progress_events.append((done, total, message)),
+        )
         assert len(results) == 2
+        mock_tts_instance.tokenizer.assert_called_once()
+        mock_tts_instance.tokenizer.pad.assert_not_called()
+        assert progress_events[-1] == (2, 2, "Completed chunk 2/2")
 
 def test_lora_loading_logic(mock_tts_instance):
     with patch("sys.modules", {**sys.modules, "peft": MagicMock()}):
@@ -94,14 +104,15 @@ def test_lora_loading_logic(mock_tts_instance):
             mock_tts_instance.unload_lora_adapter()
             assert mock_tts_instance._lora_loaded is False
 
-@patch("llama_cpp.Llama.from_pretrained")
 @patch("vieneu.standard.BaseVieneuTTS._load_codec")
 @patch.object(VieNeuTTS, '_warmup_model')
-def test_vieneu_tts_gguf_init(mock_warmup, mock_codec, mock_llama):
+def test_vieneu_tts_gguf_init(mock_warmup, mock_codec):
     mock_llama_instance = MagicMock()
-    mock_llama.return_value = mock_llama_instance
-    
-    tts = VieNeuTTS(backbone_repo="dummy-gguf", backbone_device="cpu")
+    mock_llama_class = MagicMock()
+    mock_llama_class.from_pretrained.return_value = mock_llama_instance
+
+    with patch.dict(sys.modules, {"llama_cpp": MagicMock(Llama=mock_llama_class)}):
+        tts = VieNeuTTS(backbone_repo="dummy-gguf", backbone_device="cpu")
     assert tts._is_quantized_model is True
     assert tts.backbone is not None
 

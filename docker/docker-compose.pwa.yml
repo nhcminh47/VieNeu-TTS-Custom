@@ -1,0 +1,76 @@
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+      args:
+        TORCH_INSTALL: ${TORCH_INSTALL:-cpu}
+    container_name: vieneu-server
+    environment:
+      VIENEU_HOST: 0.0.0.0
+      VIENEU_PORT: 8000
+      VIENEU_BACKEND: torch
+      VIENEU_DISABLE_LMDEPLOY: "true"
+      VIENEU_DISABLE_FLASH_ATTN: "true"
+      VIENEU_DISABLE_TORCH_COMPILE: "true"
+      VIENEU_DEVICE: auto
+      VIENEU_DTYPE: auto
+      VIENEU_OUTPUT_DIR: /workspace/outputs
+      VIENEU_MODEL_CACHE_DIR: /workspace/models
+      VIENEU_MAX_OUTPUT_FILES: ${VIENEU_MAX_OUTPUT_FILES:-100}
+      VIENEU_MAX_OUTPUT_BYTES: ${VIENEU_MAX_OUTPUT_BYTES:-2147483648}
+      VIENEU_MAX_CHAPTER_TEXT_LENGTH: ${VIENEU_MAX_CHAPTER_TEXT_LENGTH:-120000}
+      VIENEU_TTS_MAX_CHARS: ${VIENEU_TTS_MAX_CHARS:-180}
+      VIENEU_TTS_TEMPERATURE: ${VIENEU_TTS_TEMPERATURE:-0.4}
+      VIENEU_TTS_TOP_K: ${VIENEU_TTS_TOP_K:-50}
+      VIENEU_TTS_SILENCE_SECONDS: ${VIENEU_TTS_SILENCE_SECONDS:-0.18}
+      VIENEU_TTS_CROSSFADE_SECONDS: ${VIENEU_TTS_CROSSFADE_SECONDS:-0.015}
+      VIENEU_TTS_APPLY_WATERMARK: ${VIENEU_TTS_APPLY_WATERMARK:-true}
+      VIENEU_CORS_ORIGINS: ${VIENEU_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      VIENEU_PUBLIC_FRONTEND_ORIGIN: ${VIENEU_PUBLIC_FRONTEND_ORIGIN:-}
+      HF_HOME: /root/.cache/huggingface
+    ports:
+      - "${VIENEU_SERVER_PORT:-8000}:8000"
+    gpus: ${VIENEU_GPUS:-all}
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+      - vieneu_models:/workspace/models
+      - ../outputs:/workspace/outputs
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_VIENEU_API_BASE: ${NEXT_PUBLIC_VIENEU_API_BASE:-/api/vieneu}
+        VIENEU_INTERNAL_API_BASE: ${VIENEU_INTERNAL_API_BASE:-http://server:8000}
+    container_name: vieneu-studio
+    environment:
+      NEXT_PUBLIC_VIENEU_API_BASE: ${NEXT_PUBLIC_VIENEU_API_BASE:-/api/vieneu}
+      NEXT_PUBLIC_VIENEU_WS_BASE: ${NEXT_PUBLIC_VIENEU_WS_BASE:-}
+      VIENEU_INTERNAL_API_BASE: ${VIENEU_INTERNAL_API_BASE:-http://server:8000}
+    ports:
+      - "${VIENEU_FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  cloudflared:
+    profiles:
+      - cloudflare
+      - frontend-tunnel
+    image: cloudflare/cloudflared:latest
+    container_name: vieneu-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+    env_file:
+      - path: ../.env
+        required: false
+    depends_on:
+      - frontend
+      - server
+
+volumes:
+  huggingface_cache:
+  vieneu_models:
